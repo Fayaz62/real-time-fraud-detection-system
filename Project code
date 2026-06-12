@@ -1,0 +1,571 @@
+Real-Time Fraud Detection System
+Python Source Code
+"""
+Real-Time Fraud Detection System for Online Transactions
+=========================================================
+Author  : Shaik Fayaz Ahammaed
+Project : Academic Project — B.Tech CSE
+College : Loyola Institute of Technology and Management, Dhulipala
+
+Description:
+    Detects fraudulent online transactions in real time using
+    machine-learning-based anomaly detection (Isolation Forest + Random Forest).
+    Sends alerts on suspicious activity and logs all results.
+    Includes visualization utilities for model performance charts.
+"""
+
+# ══════════════════════════════════════════════════════════════
+# IMPORTS
+# ══════════════════════════════════════════════════════════════
+
+import os
+import logging
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    roc_auc_score, roc_curve, auc
+)
+import joblib
+
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend for server/script use
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+# ══════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════
+
+# ─── Logging ──────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("fraud_detection.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ─── Paths ────────────────────────────────────────────────────
+MODEL_DIR     = "models"
+OUTPUT_DIR    = "reports"
+os.makedirs(MODEL_DIR,  exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RF_MODEL_PATH = os.path.join(MODEL_DIR, "random_forest.pkl")
+IF_MODEL_PATH = os.path.join(MODEL_DIR, "isolation_forest.pkl")
+SCALER_PATH   = os.path.join(MODEL_DIR, "scaler.pkl")
+
+# ─── Visualization palette ────────────────────────────────────
+PALETTE = {
+    "fraud"  : "#D85A30",
+    "legit"  : "#1D9E75",
+    "neutral": "#7F77DD",
+    "warn"   : "#EF9F27",
+}
+sns.set_theme(style="whitegrid", font_scale=1.05)
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 1 — DATA GENERATION
+# ══════════════════════════════════════════════════════════════
+
+def generate_transaction_data(n_samples: int = 10000, fraud_ratio: float = 0.02) -> pd.DataFrame:
+    """
+    Simulate a labelled transaction dataset.
+
+    Features
+    --------
+    transaction_amount  : float  — Amount in INR
+    transaction_hour    : int    — Hour of day (0-23)
+    day_of_week         : int    — 0=Mon ... 6=Sun
+    merchant_category   : int    — Encoded category (0-9)
+    user_age            : int    — Account age in days
+    distance_from_home  : float  — km from registered address
+    transaction_freq    : float  — Transactions per day (7-day avg)
+    failed_attempts     : int    — Recent failed login attempts
+    is_international    : int    — 1 = international, 0 = domestic
+    is_fraud            : int    — Ground-truth label
+    """
+    np.random.seed(42)
+    n_fraud = int(n_samples * fraud_ratio)
+    n_legit = n_samples - n_fraud
+
+    # Legitimate transactions
+    legit = pd.DataFrame({
+        "transaction_amount": np.random.lognormal(mean=7, sigma=1.2, size=n_legit),
+        "transaction_hour"  : np.random.choice(range(8, 22), size=n_legit),
+        "day_of_week"       : np.random.randint(0, 7, size=n_legit),
+        "merchant_category" : np.random.randint(0, 10, size=n_legit),
+        "user_age"          : np.random.randint(30, 2000, size=n_legit),
+        "distance_from_home": np.abs(np.random.normal(10, 15, size=n_legit)),
+        "transaction_freq"  : np.random.uniform(0.5, 5, size=n_legit),
+        "failed_attempts"   : np.random.choice([0, 1], size=n_legit, p=[0.95, 0.05]),
+        "is_international"  : np.random.choice([0, 1], size=n_legit, p=[0.85, 0.15]),
+        "is_fraud"          : 0,
+    })
+
+    # Fraudulent transactions (anomalous patterns)
+    fraud = pd.DataFrame({
+        "transaction_amount": np.random.lognormal(mean=9, sigma=1.5, size=n_fraud),
+        "transaction_hour"  : np.random.choice(range(0, 6), size=n_fraud),    # late night
+        "day_of_week"       : np.random.randint(0, 7, size=n_fraud),
+        "merchant_category" : np.random.randint(0, 10, size=n_fraud),
+        "user_age"          : np.random.randint(1, 30, size=n_fraud),         # new accounts
+        "distance_from_home": np.abs(np.random.normal(500, 300, size=n_fraud)),
+        "transaction_freq"  : np.random.uniform(10, 50, size=n_fraud),        # high frequency
+        "failed_attempts"   : np.random.choice([2, 3, 4, 5], size=n_fraud),   # many failures
+        "is_international"  : np.random.choice([0, 1], size=n_fraud, p=[0.3, 0.7]),
+        "is_fraud"          : 1,
+    })
+
+    df = pd.concat([legit, fraud], ignore_index=True).sample(frac=1, random_state=42)
+    logger.info(f"Dataset generated: {len(df)} transactions ({n_fraud} fraudulent = {fraud_ratio*100:.1f}%)")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 2 — FEATURE ENGINEERING
+# ══════════════════════════════════════════════════════════════
+
+FEATURE_COLS = [
+    "transaction_amount", "transaction_hour", "day_of_week",
+    "merchant_category", "user_age", "distance_from_home",
+    "transaction_freq", "failed_attempts", "is_international"
+]
+
+ENGINEERED_COLS = FEATURE_COLS + ["amount_log", "is_night", "high_freq_flag", "risk_score"]
+
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived features to improve model accuracy."""
+    df = df.copy()
+    df["amount_log"]     = np.log1p(df["transaction_amount"])
+    df["is_night"]       = df["transaction_hour"].apply(lambda h: 1 if h < 6 else 0)
+    df["high_freq_flag"] = (df["transaction_freq"] > 10).astype(int)
+    df["risk_score"]     = (
+        df["failed_attempts"] * 2 +
+        df["is_night"]        * 1.5 +
+        df["is_international"] * 1 +
+        df["high_freq_flag"]  * 2
+    )
+    return df
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 3 — MODEL TRAINING
+# ══════════════════════════════════════════════════════════════
+
+def train_models(df: pd.DataFrame):
+    """Train Isolation Forest (unsupervised) + Random Forest (supervised)."""
+    df = engineer_features(df)
+    X  = df[ENGINEERED_COLS]
+    y  = df["is_fraud"]
+
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Isolation Forest — unsupervised anomaly detection
+    logger.info("Training Isolation Forest ...")
+    iso_forest = IsolationForest(
+        n_estimators=100, contamination=0.02, random_state=42, n_jobs=-1
+    )
+    iso_forest.fit(X_train)
+
+    # Random Forest — supervised classifier
+    logger.info("Training Random Forest ...")
+    rf = RandomForestClassifier(
+        n_estimators=200, max_depth=12, class_weight="balanced",
+        random_state=42, n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+
+    # Evaluation
+    y_pred = rf.predict(X_test)
+    y_prob = rf.predict_proba(X_test)[:, 1]
+
+    logger.info("\n" + "=" * 50)
+    logger.info("RANDOM FOREST EVALUATION")
+    logger.info("=" * 50)
+    logger.info("\n" + classification_report(y_test, y_pred, target_names=["Legit", "Fraud"]))
+    logger.info(f"ROC-AUC Score : {roc_auc_score(y_test, y_prob):.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    logger.info(f"Confusion Matrix:\n{cm}")
+    logger.info(f"  True Negatives  : {cm[0][0]}")
+    logger.info(f"  False Positives : {cm[0][1]}")
+    logger.info(f"  False Negatives : {cm[1][0]}")
+    logger.info(f"  True Positives  : {cm[1][1]}")
+
+    importances = pd.Series(rf.feature_importances_, index=ENGINEERED_COLS)
+    logger.info("\nTop Feature Importances:")
+    logger.info(importances.sort_values(ascending=False).to_string())
+
+    # Save models
+    joblib.dump(rf,         RF_MODEL_PATH)
+    joblib.dump(iso_forest, IF_MODEL_PATH)
+    joblib.dump(scaler,     SCALER_PATH)
+    logger.info(f"\nModels saved to '{MODEL_DIR}/'")
+
+    # Auto-generate all charts after training
+    logger.info("\nGenerating performance charts ...")
+    plot_class_distribution(y)
+    plot_feature_distributions(df)
+    plot_confusion_matrix(y_test, y_pred)
+    plot_roc_curve(y_test, y_prob)
+    plot_feature_importance(rf, ENGINEERED_COLS)
+
+    return rf, iso_forest, scaler
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 4 — REAL-TIME PREDICTION ENGINE
+# ══════════════════════════════════════════════════════════════
+
+class FraudDetector:
+    """
+    Real-time fraud detection engine.
+    Loads trained models and predicts fraud probability for incoming transactions.
+    """
+
+    ALERT_THRESHOLD = 0.60   # combined score above which an alert is raised
+
+    def __init__(self):
+        if not os.path.exists(RF_MODEL_PATH):
+            raise FileNotFoundError("Models not found. Run train_models() first.")
+        self.rf        = joblib.load(RF_MODEL_PATH)
+        self.iso       = joblib.load(IF_MODEL_PATH)
+        self.scaler    = joblib.load(SCALER_PATH)
+        self.alert_log = []
+        logger.info("FraudDetector loaded and ready.")
+
+    def predict(self, transaction: dict) -> dict:
+        """
+        Analyse a single transaction and return a risk verdict.
+
+        Parameters
+        ----------
+        transaction : dict  — keys must match FEATURE_COLS
+
+        Returns
+        -------
+        dict: {
+            transaction_id, amount, fraud_probability, anomaly_score,
+            combined_score, is_fraud_predicted, risk_level, alert, timestamp
+        }
+        """
+        tx_id = transaction.get("transaction_id", f"TXN-{datetime.now().strftime('%H%M%S%f')}")
+
+        row = pd.DataFrame([{k: transaction.get(k, 0) for k in FEATURE_COLS}])
+        row = engineer_features(row)
+        X   = self.scaler.transform(row[ENGINEERED_COLS])
+
+        # Random Forest fraud probability
+        fraud_prob = float(self.rf.predict_proba(X)[0][1])
+
+        # Isolation Forest anomaly score (normalised 0-1)
+        iso_raw       = float(self.iso.decision_function(X)[0])
+        anomaly_score = float(np.clip(1 - (iso_raw + 0.5), 0, 1))
+
+        # Weighted combined score
+        combined = 0.7 * fraud_prob + 0.3 * anomaly_score
+        is_fraud = combined >= self.ALERT_THRESHOLD
+
+        if   combined >= 0.80: risk_level = "CRITICAL"
+        elif combined >= 0.60: risk_level = "HIGH"
+        elif combined >= 0.40: risk_level = "MEDIUM"
+        else:                  risk_level = "LOW"
+
+        result = {
+            "transaction_id"    : tx_id,
+            "amount"            : transaction.get("transaction_amount", 0),
+            "fraud_probability" : round(fraud_prob, 4),
+            "anomaly_score"     : round(anomaly_score, 4),
+            "combined_score"    : round(combined, 4),
+            "is_fraud_predicted": is_fraud,
+            "risk_level"        : risk_level,
+            "alert"             : is_fraud,
+            "timestamp"         : datetime.now().isoformat(),
+        }
+
+        if is_fraud:
+            logger.warning(
+                f"FRAUD ALERT | {tx_id} | Rs.{result['amount']:,.2f} | "
+                f"Risk={risk_level} | Score={combined:.4f}"
+            )
+            self.alert_log.append(result)
+        else:
+            logger.info(
+                f"Legitimate  | {tx_id} | Rs.{result['amount']:,.2f} | "
+                f"Risk={risk_level} | Score={combined:.4f}"
+            )
+
+        return result
+
+    def batch_predict(self, transactions: list) -> pd.DataFrame:
+        """Score a list of transaction dicts and return a results DataFrame."""
+        return pd.DataFrame([self.predict(tx) for tx in transactions])
+
+    def get_alert_summary(self) -> dict:
+        """Return summary statistics for all alerts raised in this session."""
+        total   = len(self.alert_log)
+        amounts = [a["amount"] for a in self.alert_log]
+        return {
+            "total_alerts"        : total,
+            "high_risk_alerts"    : sum(1 for a in self.alert_log if a["risk_level"] in ("HIGH", "CRITICAL")),
+            "total_flagged_amount": sum(amounts),
+            "avg_flagged_amount"  : round(sum(amounts) / total, 2) if total else 0,
+        }
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 5 — VISUALIZATION
+# ══════════════════════════════════════════════════════════════
+
+def plot_class_distribution(y: pd.Series, save: bool = True) -> str:
+    """Bar + pie chart of fraud vs legitimate class balance."""
+    counts = y.value_counts()
+    labels = ["Legitimate", "Fraudulent"]
+    colors = [PALETTE["legit"], PALETTE["fraud"]]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].bar(labels, counts.values, color=colors, width=0.5, edgecolor="white", linewidth=1.5)
+    axes[0].set_title("Transaction Class Distribution", fontweight="bold")
+    axes[0].set_ylabel("Count")
+    for i, v in enumerate(counts.values):
+        axes[0].text(i, v + 20, f"{v:,}", ha="center", fontsize=10, fontweight="bold")
+
+    axes[1].pie(counts.values, labels=labels, colors=colors, autopct="%1.2f%%",
+                startangle=90, wedgeprops=dict(edgecolor="white", linewidth=2))
+    axes[1].set_title("Fraud vs Legitimate (%)", fontweight="bold")
+
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "class_distribution.png")
+    if save:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close()
+    return path
+
+
+def plot_feature_distributions(df: pd.DataFrame, save: bool = True) -> str:
+    """Overlapping histograms per feature, coloured by fraud label."""
+    features = [
+        "transaction_amount", "transaction_hour",
+        "distance_from_home", "transaction_freq",
+        "failed_attempts", "user_age"
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes = axes.flatten()
+
+    for i, feat in enumerate(features):
+        for label, color, name in [
+            (0, PALETTE["legit"], "Legitimate"),
+            (1, PALETTE["fraud"], "Fraudulent")
+        ]:
+            axes[i].hist(df[df["is_fraud"] == label][feat],
+                         bins=40, alpha=0.6, color=color, label=name, density=True)
+        axes[i].set_title(feat.replace("_", " ").title(), fontweight="bold")
+        axes[i].legend(fontsize=8)
+
+    plt.suptitle("Feature Distributions: Fraudulent vs Legitimate",
+                 fontsize=14, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "feature_distributions.png")
+    if save:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close()
+    return path
+
+
+def plot_confusion_matrix(y_true, y_pred, save: bool = True) -> str:
+    """Heatmap of TP / FP / TN / FN."""
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="YlOrRd",
+                xticklabels=["Predicted Legit", "Predicted Fraud"],
+                yticklabels=["Actual Legit",    "Actual Fraud"],
+                linewidths=1, linecolor="white", ax=ax)
+    ax.set_title("Confusion Matrix", fontweight="bold", fontsize=13)
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
+    if save:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close()
+    return path
+
+
+def plot_roc_curve(y_true, y_prob, save: bool = True) -> str:
+    """ROC curve with AUC annotation."""
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    roc_auc     = auc(fpr, tpr)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, color=PALETTE["fraud"], lw=2,
+            label=f"ROC Curve (AUC = {roc_auc:.4f})")
+    ax.plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--", label="Random Classifier")
+    ax.fill_between(fpr, tpr, alpha=0.1, color=PALETTE["fraud"])
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve — Fraud Detection Model", fontweight="bold")
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "roc_curve.png")
+    if save:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close()
+    return path
+
+
+def plot_feature_importance(model, feature_names: list, save: bool = True) -> str:
+    """Horizontal bar chart of Random Forest feature importances."""
+    importances = pd.Series(model.feature_importances_, index=feature_names).sort_values()
+    colors = [PALETTE["fraud"] if v > importances.median() else PALETTE["neutral"]
+              for v in importances]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    importances.plot(kind="barh", ax=ax, color=colors, edgecolor="white", linewidth=0.8)
+    ax.set_title("Feature Importance — Random Forest", fontweight="bold")
+    ax.set_xlabel("Importance Score")
+    for bar in ax.patches:
+        ax.text(bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
+                f"{bar.get_width():.3f}", va="center", fontsize=9)
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "feature_importance.png")
+    if save:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close()
+    return path
+
+
+def plot_transaction_timeline(results_df: pd.DataFrame, save: bool = True) -> str:
+    """Bar chart of combined risk scores for a batch of transactions."""
+    color_map = {
+        "LOW"     : PALETTE["legit"],
+        "MEDIUM"  : PALETTE["warn"],
+        "HIGH"    : PALETTE["fraud"],
+        "CRITICAL": "#8B0000",
+    }
+    fig, ax = plt.subplots(figsize=(12, 4))
+    x      = range(len(results_df))
+    colors = [color_map.get(r, PALETTE["neutral"]) for r in results_df["risk_level"]]
+
+    ax.bar(x, results_df["combined_score"], color=colors, edgecolor="white", linewidth=0.8)
+    ax.axhline(0.60, color="red", linestyle="--", linewidth=1, label="Alert Threshold (0.60)")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(results_df["transaction_id"].tolist(), rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("Combined Risk Score")
+    ax.set_title("Transaction Risk Timeline", fontweight="bold")
+
+    patches = [mpatches.Patch(color=v, label=k) for k, v in color_map.items()]
+    ax.legend(
+        handles=patches + [plt.Line2D([0], [0], color="red", linestyle="--", label="Threshold")],
+        loc="upper right", fontsize=8
+    )
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "transaction_timeline.png")
+    if save:
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close()
+    return path
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 6 — DEMO / MAIN
+# ══════════════════════════════════════════════════════════════
+
+def run_demo():
+    logger.info("\n" + "=" * 60)
+    logger.info("  Real-Time Fraud Detection System — Demo")
+    logger.info("  Author: Shaik Fayaz Ahammaed")
+    logger.info("=" * 60 + "\n")
+
+    # Step 1: Train if models don't exist yet
+    if not os.path.exists(RF_MODEL_PATH):
+        df = generate_transaction_data(n_samples=10000, fraud_ratio=0.02)
+        train_models(df)
+    else:
+        logger.info("Pre-trained models found — skipping training.")
+
+    # Step 2: Load real-time detector
+    detector = FraudDetector()
+
+    # Step 3: Sample transactions
+    sample_transactions = [
+        {   # Normal daytime purchase
+            "transaction_id"    : "TXN-001",
+            "transaction_amount": 1200.0,
+            "transaction_hour"  : 14,
+            "day_of_week"       : 2,
+            "merchant_category" : 3,
+            "user_age"          : 850,
+            "distance_from_home": 5.2,
+            "transaction_freq"  : 1.8,
+            "failed_attempts"   : 0,
+            "is_international"  : 0,
+        },
+        {   # Suspicious: large, late night, new account, far from home
+            "transaction_id"    : "TXN-002",
+            "transaction_amount": 85000.0,
+            "transaction_hour"  : 3,
+            "day_of_week"       : 6,
+            "merchant_category" : 7,
+            "user_age"          : 4,
+            "distance_from_home": 1200.0,
+            "transaction_freq"  : 35.0,
+            "failed_attempts"   : 4,
+            "is_international"  : 1,
+        },
+        {   # Medium-risk: international, some failed attempts
+            "transaction_id"    : "TXN-003",
+            "transaction_amount": 15000.0,
+            "transaction_hour"  : 22,
+            "day_of_week"       : 5,
+            "merchant_category" : 2,
+            "user_age"          : 120,
+            "distance_from_home": 300.0,
+            "transaction_freq"  : 8.0,
+            "failed_attempts"   : 2,
+            "is_international"  : 1,
+        },
+    ]
+
+    # Step 4: Batch predict & show results
+    logger.info("\n--- Processing Sample Transactions ---")
+    results = detector.batch_predict(sample_transactions)
+    print("\n" + results[
+        ["transaction_id", "amount", "risk_level", "combined_score", "alert"]
+    ].to_string(index=False))
+
+    # Step 5: Risk timeline chart
+    plot_transaction_timeline(results)
+
+    # Step 6: Alert summary
+    summary = detector.get_alert_summary()
+    logger.info(f"\nAlert Summary: {summary}")
+
+
+if __name__ == "__main__":
+    run_demo()
+
+
+← Back to Project
